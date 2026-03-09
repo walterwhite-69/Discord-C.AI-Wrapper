@@ -57,6 +57,7 @@ async def spawn_character_to_channel(
     fallback_name: str | None = None,
     fallback_avatar_url: str | None = None,
     follow_mode: str = "auto",
+    owner_user_id: int = 0,
 ) -> tuple[ActiveCharacter, str | None, str | None]:
     existing = sessions.get_active(channel.id)
     if existing:
@@ -84,6 +85,7 @@ async def spawn_character_to_channel(
         webhook_id=webhook.id,
         webhook_url=webhook.url,
         follow_mode=follow_mode,
+        owner_user_id=owner_user_id,
     )
     sessions.spawn(channel.id, active)
     return active, greeting, greeting_turn_id
@@ -174,6 +176,7 @@ class FollowModeView(discord.ui.View):
                 fallback_name=str(self.character.get("name") or "Character"),
                 fallback_avatar_url=str(self.character.get("avatar_url") or ""),
                 follow_mode=mode,
+                owner_user_id=self.owner_id,
             )
 
             mode_text = "Auto-follow enabled (responds to every message)." if mode == "auto" else "Reply-only mode enabled (responds only when users reply to bot messages)."
@@ -441,7 +444,7 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    token = sessions.get_token(message.author.id)
+    token = sessions.get_token(char.owner_user_id) if char.owner_user_id else sessions.get_token(message.author.id)
     if token is None:
         await bot.process_commands(message)
         return
@@ -549,7 +552,7 @@ async def cmd_logout(interaction: discord.Interaction):
 @bot.tree.command(name="search", description="Search for characters on Character.AI")
 @app_commands.describe(query="Search term, e.g. Naruto or therapist")
 async def cmd_search(interaction: discord.Interaction, query: str):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
 
     token = require_login(interaction)
     if not token:
@@ -567,7 +570,6 @@ async def cmd_search(interaction: discord.Interaction, query: str):
         if not raw_chars:
             await interaction.followup.send(
                 embed=await cai_error_embed(f'No characters found for "{query}".'),
-                ephemeral=True,
             )
             return
 
@@ -591,12 +593,11 @@ async def cmd_search(interaction: discord.Interaction, query: str):
             query=query,
             characters=normalized,
         )
-        await interaction.followup.send(embeds=view.build_embeds(), view=view, ephemeral=True)
+        await interaction.followup.send(embeds=view.build_embeds(), view=view)
     except Exception as e:
         traceback.print_exc()
         await interaction.followup.send(
             embed=await cai_error_embed(f"Search failed: {e}"),
-            ephemeral=True,
         )
 
 

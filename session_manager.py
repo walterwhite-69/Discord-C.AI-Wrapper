@@ -13,6 +13,7 @@ class ActiveCharacter:
     webhook_id: int
     webhook_url: str
     follow_mode: str = "auto"
+    owner_user_id: int = 0
 
 
 class SessionManager:
@@ -55,15 +56,16 @@ class SessionManager:
                 if not isinstance(payload, dict):
                     continue
                 try:
-                    parsed_active[channel_id] = ActiveCharacter(
+                        parsed_active[channel_id] = ActiveCharacter(
                         char_id=str(payload.get("char_id") or ""),
                         chat_id=str(payload.get("chat_id") or ""),
                         name=str(payload.get("name") or "Character"),
                         avatar_url=str(payload.get("avatar_url") or ""),
-                        webhook_id=int(payload.get("webhook_id") or 0),
-                        webhook_url=str(payload.get("webhook_url") or ""),
-                        follow_mode=str(payload.get("follow_mode") or "auto"),
-                    )
+                            webhook_id=int(payload.get("webhook_id") or 0),
+                            webhook_url=str(payload.get("webhook_url") or ""),
+                            follow_mode=str(payload.get("follow_mode") or "auto"),
+                            owner_user_id=int(payload.get("owner_user_id") or 0),
+                        )
                 except Exception:
                     continue
             self._active = parsed_active
@@ -101,6 +103,7 @@ class SessionManager:
                     "webhook_id": c.webhook_id,
                     "webhook_url": c.webhook_url,
                     "follow_mode": c.follow_mode,
+                    "owner_user_id": c.owner_user_id,
                 }
                 for channel_id, c in self._active.items()
             },
