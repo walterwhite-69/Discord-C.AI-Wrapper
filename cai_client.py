@@ -1,10 +1,17 @@
 import asyncio
+import functools
+import inspect
 import json
 import urllib.parse
 import uuid as _uuid_mod
 from typing import Any, Optional
 
 from curl_cffi.requests import AsyncSession
+
+try:
+    from curl_cffi import CurlWsFlag
+except Exception:
+    CurlWsFlag = None
 
 
 NEO_BASE = "https://neo.character.ai"
@@ -45,6 +52,101 @@ def _parse_json(raw: str) -> dict[str, Any] | None:
     except Exception:
         return None
 
+
+async def _ws_invoke(method: Any, *args: Any) -> Any:
+    if inspect.iscoroutinefunction(method):
+        return await method(*args)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, functools.partial(method, *args))
+
+
+async def _ws_send_json(ws: Any, payload: dict[str, Any]) -> None:
+    if hasattr(ws, "send_json"):
+        await _ws_invoke(ws.send_json, payload)
+        return
+    data = json.dumps(payload)
+    if hasattr(ws, "send_str"):
+        await _ws_invoke(ws.send_str, data)
+        return
+    if hasattr(ws, "send"):
+        if CurlWsFlag is not None:
+            await _ws_invoke(ws.send, data.encode("utf-8"), CurlWsFlag.TEXT)
+        else:
+            await _ws_invoke(ws.send, data.encode("utf-8"))
+        return
+    if hasattr(ws, "send_bytes"):
+        await _ws_invoke(ws.send_bytes, data.encode("utf-8"))
+        return
+    raise RuntimeError(f"{type(ws).__name__} has no send method")
+
+
+async def _ws_recv_str(ws: Any, timeout: float) -> str:
+    if hasattr(ws, "recv_str"):
+        raw = await asyncio.wait_for(_ws_invoke(ws.recv_str), timeout=timeout)
+    elif hasattr(ws, "recv"):
+        raw = await asyncio.wait_for(_ws_invoke(ws.recv), timeout=timeout)
+    else:
+        raise RuntimeError(f"{type(ws).__name__} has no recv method")
+    if isinstance(raw, tuple):
+        raw = raw[0]
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+    return raw
+
+
+
+async def _connect_ws_debug(client: "CAIClient", char_id: str):
+    chat_id = str(_uuid_mod.uuid4())
+    req_id = f"{_uuid_mod.uuid4().hex[:20]}{char_id[-12:]}"
+
+    async with AsyncSession(impersonate="chrome124") as session:
+        ws = None
+        try:
+            ws = await client._connect_ws(session)
+            yield "WS connected, sending create_chat..."
+
+            await _ws_send_json(
+                ws,
+                {
+                    "command": "create_chat",
+                    "request_id": req_id,
+                    "payload": {
+                        "chat_type": "TYPE_ONE_ON_ONE",
+                        "chat": {
+                            "chat_id": chat_id,
+                            "creator_id": client._user_id,
+                            "visibility": "VISIBILITY_PRIVATE",
+                            "character_id": char_id,
+                            "type": "TYPE_ONE_ON_ONE",
+                        },
+                        "with_greeting": True,
+                        "with_pre_generated_history": False,
+                    },
+                    "origin_id": "web-next",
+                },
+            )
+            yield "Sent create_chat, waiting up to 20s for any frame..."
+
+            deadline = asyncio.get_running_loop().time() + 20.0
+            got_any = False
+            while asyncio.get_running_loop().time() < deadline:
+                try:
+                    raw = await _ws_recv_str(ws, timeout=5.0)
+                except asyncio.TimeoutError:
+                    yield "...still waiting (5s tick)"
+                    continue
+                got_any = True
+                yield f"RECV: {raw}"
+            if not got_any:
+                yield "No frames received at all within 20s."
+        except Exception as e:
+            yield f"ERROR: {type(e).__module__}.{type(e).__name__}: {e!r}"
+        finally:
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
 
 def _extract_turn(evt: dict[str, Any]) -> dict[str, Any]:
     if isinstance(evt.get("turn"), dict):
@@ -188,7 +290,7 @@ class CAIClient:
             return await session.ws_connect(
                 url="wss://neo.character.ai/ws/",
                 headers=_ws_headers(),
-                cookies={"HTTP_AUTHORIZATION": f"Token {self.token}"},
+                cookies={"HTTP_AUTHORIZATION": f'"Token {self.token}"'},
             )
         except Exception as e:
             last_err = e
@@ -221,7 +323,8 @@ class CAIClient:
                     ws = await self._connect_ws(session)
                     req_id = f"{_uuid_mod.uuid4().hex[:20]}{char_id[-12:]}"
 
-                    await ws.send_json(
+                    await _ws_send_json(
+                        ws,
                         {
                             "command": "create_chat",
                             "request_id": req_id,
@@ -235,6 +338,7 @@ class CAIClient:
                                     "type": "TYPE_ONE_ON_ONE",
                                 },
                                 "with_greeting": True,
+                                "with_pre_generated_history": False,
                             },
                             "origin_id": "web-next",
                         }
@@ -242,7 +346,7 @@ class CAIClient:
 
                     deadline = asyncio.get_running_loop().time() + 24.0
                     while asyncio.get_running_loop().time() < deadline:
-                        raw = await asyncio.wait_for(ws.recv_str(), timeout=8.0)
+                        raw = await _ws_recv_str(ws, timeout=8.0)
                         evt = _parse_json(raw)
                         if not evt:
                             continue
@@ -271,7 +375,7 @@ class CAIClient:
 
                     break
                 except Exception as e:
-                    ws_error = str(e)
+                    ws_error = f"{type(e).__module__}.{type(e).__name__}: {e!r}"
                     if attempt == 1:
                         print(f"[!] WS start_chat error: {ws_error}")
                 finally:
@@ -340,7 +444,8 @@ class CAIClient:
                     turn_id = str(_uuid_mod.uuid4())
                     cand_id = str(_uuid_mod.uuid4())
 
-                    await ws.send_json(
+                    await _ws_send_json(
+            ws,
                         {
                             "command": "create_and_generate_turn",
                             "request_id": req_id,
@@ -404,7 +509,7 @@ class CAIClient:
                     updates: list[str] = []
                     deadline = asyncio.get_running_loop().time() + 45.0
                     while asyncio.get_running_loop().time() < deadline:
-                        raw = await asyncio.wait_for(ws.recv_str(), timeout=10.0)
+                        raw = await _ws_recv_str(ws, timeout=10.0)
                         evt = _parse_json(raw)
                         if not evt:
                             continue
@@ -433,7 +538,8 @@ class CAIClient:
                 except asyncio.TimeoutError:
                     last_error = "Socket timeout while waiting for response"
                 except Exception as e:
-                    last_error = str(e)
+                    last_error = f"{type(e).__module__}.{type(e).__name__}: {e!r}"
+                    print(f"[!] WS send_message error: {last_error}")
                 finally:
                     if ws is not None:
                         try:
@@ -459,7 +565,8 @@ class CAIClient:
                 try:
                     ws = await self._connect_ws(session)
                     req_id = str(_uuid_mod.uuid4())
-                    await ws.send_json(
+                    await _ws_send_json(
+            ws,
                         {
                             "command": "generate_turn_candidate",
                             "request_id": req_id,
@@ -506,7 +613,7 @@ class CAIClient:
                     partial_turn_id: Optional[str] = None
                     deadline = asyncio.get_running_loop().time() + 45.0
                     while asyncio.get_running_loop().time() < deadline:
-                        raw = await asyncio.wait_for(ws.recv_str(), timeout=10.0)
+                        raw = await _ws_recv_str(ws, timeout=10.0)
                         evt = _parse_json(raw)
                         if not evt:
                             continue
@@ -531,7 +638,8 @@ class CAIClient:
                 except asyncio.TimeoutError:
                     last_error = "Socket timeout while waiting for regeneration"
                 except Exception as e:
-                    last_error = str(e)
+                    last_error = f"{type(e).__module__}.{type(e).__name__}: {e!r}"
+                    print(f"[!] WS regenerate error: {last_error}")
                 finally:
                     if ws is not None:
                         try:
